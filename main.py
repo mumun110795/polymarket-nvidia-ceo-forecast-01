@@ -1,0 +1,217 @@
+#!/usr/bin/env python3
+"""polymarket-nvidia-ceo-forecast-01 entry v1 (Python 3.13, stdlib only).
+
+Per-market realised-volatility persistence forecaster.
+
+Model, per market of a case:
+  - Median (tau = 0.5) is persistence: the market's last price x at the
+    checkpoint, for every horizon minute h = 1..horizon.
+  - Spread comes from the market's own 1-minute price differences.
+    Let a_i = min(|p_i - p_{i-1}|, DIFF_CAP) be the winsorised absolute
+    moves (the cap keeps a single news jump from dominating the mean).
+    A window's sigma estimate is the Gaussian-consistent rescaling of
+    the mean absolute move:
+
+        sigma(window) = sqrt(pi / 2) * mean(a_i over window)
+
+    (for a normal move, E|move| = sigma * sqrt(2 / pi)).
+  - Two windows are blended so the spread tracks the current regime
+    without forgetting that these markets can jump:
+
+        sigma = 0.7 * sigma(last 360 diffs) + 0.3 * sigma(last 1440 diffs)
+
+    then clamped to [SIGMA_MIN, SIGMA_MAX] so a dead market still gets
+    a small honest spread and a wild one cannot explode. A market with
+    fewer than 2 usable prices falls back to the house sigma 0.0025.
+  - Quantiles widen like a random walk (alpha = 0.5):
+
+        q_tau(h) = clamp(x + z_tau * sigma * h**0.5, 0, 1)
+
+    with z the standard normal quantiles at [0.05, 0.25, 0.5, 0.75,
+    0.95]. Each value is rounded to 6 decimals and the row is forced
+    non-decreasing after clamping/rounding.
+
+I/O contract (program/v1, per-file cases): read every *.in file in
+$MAKEFUN_INPUT_DIR (fallback /input) in name order; for each case write
+<case-id>.out to $MAKEFUN_OUTPUT_DIR (fallback /output) holding exactly
+{"forecasts": [{"id": ..., "q": [[...] x horizon]} ...]} with compact
+JSON separators. Fully deterministic: no randomness, no clock, no
+network -- two runs on the same case are byte-identical.
+"""
+
+import json
+import math
+import os
+from statistics import NormalDist
+
+INPUT_DIR = os.environ.get("MAKEFUN_INPUT_DIR", "/input")
+OUTPUT_DIR = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
+
+# Standard normal quantiles at the scored levels, to 6 decimals
+# (same constants as the house baseline).
+Z_TABLE = {
+    0.05: -1.644854,
+    0.25: -0.67449,
+    0.5: 0.0,
+    0.75: 0.67449,
+    0.95: 1.644854,
+}
+_NORMAL = NormalDist()
+
+ALPHA = 0.5            # horizon exponent: spread ~ h**ALPHA
+WIN_RECENT = 360       # minutes: short realised-vol window
+WIN_LONG = 1440        # minutes: long realised-vol window
+W_RECENT = 0.7         # blend weight of the short window
+DIFF_CAP = 0.02        # winsorising cap on a single 1-minute move
+SIGMA_MIN = 0.0008     # floor, price units per sqrt(minute)
+SIGMA_MAX = 0.012      # cap, price units per sqrt(minute)
+SIGMA_FALLBACK = 0.0025  # house baseline sigma, for degenerate inputs
+
+# E|N(0, sigma)| = sigma * sqrt(2/pi)  =>  sigma = mean|move| * sqrt(pi/2).
+_MEAN_ABS_TO_SIGMA = math.sqrt(math.pi / 2.0)
+
+
+def _z_for(tau):
+    """Standard normal quantile for a requested level."""
+    z = Z_TABLE.get(tau)
+    if z is not None:
+        return z
+    return _NORMAL.inv_cdf(tau)
+
+
+def _clean_prices(raw):
+    """Finite floats only: a non-finite entry repeats the last good one."""
+    cleaned = []
+    last = None
+    for p in raw:
+        try:
+            v = float(p)
+        except (TypeError, ValueError):
+            v = math.nan
+        if math.isfinite(v):
+            last = v
+            cleaned.append(v)
+        elif last is not None:
+            cleaned.append(last)
+        else:
+            cleaned.append(0.5)
+    return cleaned
+
+
+def _window_sigma(abs_diffs):
+    """Sigma estimate from winsorised absolute diffs of one window."""
+    if not abs_diffs:
+        return None
+    return _MEAN_ABS_TO_SIGMA * (sum(abs_diffs) / len(abs_diffs))
+
+
+def estimate_sigma(prices):
+    """Blended, floored, capped realised sigma for one market."""
+    if len(prices) < 2:
+        return SIGMA_FALLBACK
+    abs_diffs = []
+    prev = prices[0]
+    for p in prices[1:]:
+        d = abs(p - prev)
+        prev = p
+        if d > DIFF_CAP:
+            d = DIFF_CAP
+        abs_diffs.append(d)
+    s_recent = _window_sigma(abs_diffs[-WIN_RECENT:])
+    s_long = _window_sigma(abs_diffs[-WIN_LONG:])
+    if s_recent is None:
+        return SIGMA_FALLBACK
+    if s_long is None:
+        sigma = s_recent
+    else:
+        sigma = W_RECENT * s_recent + (1.0 - W_RECENT) * s_long
+    if sigma < SIGMA_MIN:
+        return SIGMA_MIN
+    if sigma > SIGMA_MAX:
+        return SIGMA_MAX
+    return sigma
+
+
+def forecast_rows(x, sigma, horizon, zs):
+    """horizon rows of quantiles around the last price x."""
+    rows = []
+    for h in range(1, horizon + 1):
+        spread = sigma * (h ** ALPHA)
+        row = []
+        prev_q = 0.0
+        for z in zs:
+            v = x + z * spread
+            if v < 0.0:
+                v = 0.0
+            elif v > 1.0:
+                v = 1.0
+            v = round(v, 6) + 0.0  # "+ 0.0" normalises -0.0 to 0.0
+            if v < prev_q:
+                v = prev_q
+            prev_q = v
+            row.append(v)
+        rows.append(row)
+    return rows
+
+
+def forecast_case(case):
+    # An invalid case scores as all-0.5 and voids the entry, so every
+    # field is parsed defensively: a malformed value falls back to the
+    # contract's defaults instead of crashing the run.
+    try:
+        horizon = int(case.get("horizon_minutes", 240))
+    except (TypeError, ValueError):
+        horizon = 240
+    if horizon <= 0:
+        horizon = 240
+    taus = case.get("quantiles") or [0.05, 0.25, 0.5, 0.75, 0.95]
+    zs = [_z_for(float(t)) for t in taus]
+    forecasts = []
+    for market in case.get("markets", []):
+        try:
+            raw = market.get("prices")
+            prices = _clean_prices(raw) if isinstance(raw, list) else []
+            if prices:
+                x = prices[-1]
+                if x < 0.0:
+                    x = 0.0
+                elif x > 1.0:
+                    x = 1.0
+                sigma = estimate_sigma(prices)
+            else:
+                x = 0.5
+                sigma = SIGMA_FALLBACK
+            rows = forecast_rows(x, sigma, horizon, zs)
+        except Exception:
+            # Last-resort row: baseline spread around 0.5 keeps the
+            # case valid in shape even for a pathological market.
+            rows = forecast_rows(0.5, SIGMA_FALLBACK, horizon, zs)
+        forecasts.append({"id": market.get("id"), "q": rows})
+    return {"forecasts": forecasts}
+
+
+def main():
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    try:
+        names = os.listdir(INPUT_DIR)
+    except FileNotFoundError:
+        return
+    for name in sorted(n for n in names if n.endswith(".in")):
+        case_id = name[: -len(".in")]
+        # One unreadable file must not take down the other cases of a
+        # multi-case run; in the grader's one-case runs this changes
+        # nothing (a case that cannot be read cannot be forecast).
+        try:
+            with open(os.path.join(INPUT_DIR, name), "r", encoding="utf-8") as fh:
+                case = json.load(fh)
+            payload = json.dumps(forecast_case(case), separators=(",", ":"))
+        except Exception:
+            continue
+        out_path = os.path.join(OUTPUT_DIR, case_id + ".out")
+        with open(out_path, "w", encoding="utf-8") as fh:
+            fh.write(payload)
+            fh.write("\n")
+
+
+if __name__ == "__main__":
+    main()
