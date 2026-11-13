@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""polymarket-nvidia-ceo-forecast-01 entry v1 (Python 3.13, stdlib only).
+"""polymarket-nvidia-ceo-forecast-01 entry v2 (Python 3.13, stdlib only).
 
 Per-market realised-volatility persistence forecaster.
 
@@ -15,14 +15,22 @@ Model, per market of a case:
         sigma(window) = sqrt(pi / 2) * mean(a_i over window)
 
     (for a normal move, E|move| = sigma * sqrt(2 / pi)).
-  - Two windows are blended so the spread tracks the current regime
+  - Three windows are blended so the spread tracks the current regime
     without forgetting that these markets can jump:
 
-        sigma = 0.7 * sigma(last 360 diffs) + 0.3 * sigma(last 1440 diffs)
+        sigma = 0.4 * sigma(last 120 diffs) + 0.4 * sigma(last 360 diffs)
+              + 0.2 * sigma(last 1440 diffs)
 
-    then clamped to [SIGMA_MIN, SIGMA_MAX] so a dead market still gets
-    a small honest spread and a wild one cannot explode. A market with
+    (weights renormalised over the windows that have data), then
+    clamped to [SIGMA_MIN, SIGMA_MAX] so a dead market still gets a
+    small honest spread and a wild one cannot explode. A market with
     fewer than 2 usable prices falls back to the house sigma 0.0025.
+
+  v2 tuning (local backtest on practice cases p00..p04, actuals taken
+  from the next case's prices; v1 scored 0.323223 there): the blend
+  above, DIFF_CAP 0.05 and SIGMA_MIN 0.0004 scored 0.308646 and beat
+  v1 on all five cases; alpha stays 0.5 (0.40/0.44/0.60 all scored
+  worse) and SIGMA_MAX stays 0.012.
   - Quantiles widen like a random walk (alpha = 0.5):
 
         q_tau(h) = clamp(x + z_tau * sigma * h**0.5, 0, 1)
@@ -59,11 +67,10 @@ Z_TABLE = {
 _NORMAL = NormalDist()
 
 ALPHA = 0.5            # horizon exponent: spread ~ h**ALPHA
-WIN_RECENT = 360       # minutes: short realised-vol window
-WIN_LONG = 1440        # minutes: long realised-vol window
-W_RECENT = 0.7         # blend weight of the short window
-DIFF_CAP = 0.02        # winsorising cap on a single 1-minute move
-SIGMA_MIN = 0.0008     # floor, price units per sqrt(minute)
+# (window minutes, blend weight) for the realised-vol estimate.
+WINDOWS = ((120, 0.4), (360, 0.4), (1440, 0.2))
+DIFF_CAP = 0.05        # winsorising cap on a single 1-minute move
+SIGMA_MIN = 0.0004     # floor, price units per sqrt(minute)
 SIGMA_MAX = 0.012      # cap, price units per sqrt(minute)
 SIGMA_FALLBACK = 0.0025  # house baseline sigma, for degenerate inputs
 
@@ -117,14 +124,16 @@ def estimate_sigma(prices):
         if d > DIFF_CAP:
             d = DIFF_CAP
         abs_diffs.append(d)
-    s_recent = _window_sigma(abs_diffs[-WIN_RECENT:])
-    s_long = _window_sigma(abs_diffs[-WIN_LONG:])
-    if s_recent is None:
+    num = 0.0
+    den = 0.0
+    for window, weight in WINDOWS:
+        s = _window_sigma(abs_diffs[-window:])
+        if s is not None:
+            num += weight * s
+            den += weight
+    if den == 0.0:
         return SIGMA_FALLBACK
-    if s_long is None:
-        sigma = s_recent
-    else:
-        sigma = W_RECENT * s_recent + (1.0 - W_RECENT) * s_long
+    sigma = num / den
     if sigma < SIGMA_MIN:
         return SIGMA_MIN
     if sigma > SIGMA_MAX:
