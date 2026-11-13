@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""polymarket-nvidia-ceo-forecast-01 entry v5 (Python 3.13, stdlib only).
+"""polymarket-nvidia-ceo-forecast-01 entry v6 (Python 3.13, stdlib only).
 
 Per-market realised-volatility forecaster with a sum-reverting median.
 
@@ -75,6 +75,21 @@ Model, per market of a case:
   component (0.272560 filter-only, >= 0.305981 with the component),
   tail-specific bucket scales, median offsets, and the burst
   window re-tested in the full stack (still degrades p00).
+
+  v6 tuning (true grader, v5 = 0.253182): the top activity tertile
+  of each case (by price-change count) gets sigma x TIER_SIGMA_HI =
+  1.15 -- the plateau over 1.10..1.30 is flat (0.252661..0.252826
+  alone) -- and the q75 offset deepens to -0.04, the argmin of the
+  flat basin re-measured in a two-factor grid with q95 (q95 +0.005
+  dominates both rows; -0.05 turns back up). Combined score
+  0.252411, winning 5 of 6 cases against v5 (p03 the exception).
+  Rejected this round: horizon profiles for the q75 offset (ramp /
+  late / early all worse than constant), a median-only sumrev
+  glide (0.258286 -- the fan-wide glide of the current design is
+  worth ~0.005), narrower bucket-3 or sigma for the active tier
+  (the churn hypothesis inverted: active markets need MORE width),
+  per-tier q75 offsets (noise, both directions ~0.2530), and a
+  240-minute-only sigma for the active tier (0.253911).
   - Quantiles widen like a random walk (alpha = 0.5):
 
         q_tau(h) = clamp(centre(h) + z_tau * sigma * h**0.5, 0, 1)
@@ -124,7 +139,12 @@ STALE_MULT = 0.5
 # Additive per-quantile offsets (for the 0.05/0.25/0.5/0.75/0.95 rows),
 # calibrated on the true grader: realised outcomes skew below the fan,
 # so q75 sits too high, while the extreme upper tail sits too low.
-Q_OFFSETS = (0.0, 0.0, 0.0, -0.03, 0.005)
+Q_OFFSETS = (0.0, 0.0, 0.0, -0.04, 0.005)
+# The most active third of a case's markets (by count of price
+# changes in the input window) get their sigma scaled by this
+# factor: their moves cluster and persist, so the realised-vol fan
+# under-disperses them.
+TIER_SIGMA_HI = 1.15
 # (window minutes, blend weight) for the realised-vol estimate.
 WINDOWS = ((120, 0.4), (360, 0.4), (1440, 0.2))
 DIFF_CAP = 0.05        # winsorising cap on a single 1-minute move
@@ -272,13 +292,30 @@ def forecast_case(case):
                     x = 1.0
                 total += x
                 sigma = _stale_adjust(prices, estimate_sigma(prices))
-                prepared.append((market.get("id"), x, sigma, True))
+                nchanges = 0
+                for i in range(1, len(prices)):
+                    if prices[i] != prices[i - 1]:
+                        nchanges += 1
+                prepared.append((market.get("id"), x, sigma, True, nchanges))
             else:
-                prepared.append((market.get("id"), 0.5, SIGMA_FALLBACK, False))
+                prepared.append((market.get("id"), 0.5, SIGMA_FALLBACK, False, 0))
         except Exception:
-            prepared.append((market.get("id"), 0.5, SIGMA_FALLBACK, False))
+            prepared.append((market.get("id"), 0.5, SIGMA_FALLBACK, False, 0))
+    # Activity tiers: within-case tertiles by price-change count.
+    # The top tertile gets the TIER_SIGMA_HI sigma widening.
+    n_mkts = len(prepared)
+    order = sorted(range(n_mkts), key=lambda i: prepared[i][4])
+    tiers = [0] * n_mkts
+    for rank, idx in enumerate(order):
+        tiers[idx] = 0 if rank < n_mkts / 3 else 1 if rank < 2 * n_mkts / 3 else 2
     forecasts = []
-    for mid, x, sigma, has_prices in prepared:
+    for k, (mid, x, sigma, has_prices, _nch) in enumerate(prepared):
+        if has_prices and tiers[k] == 2:
+            sigma *= TIER_SIGMA_HI
+            if sigma < 0.0001:
+                sigma = 0.0001
+            elif sigma > SIGMA_MAX:
+                sigma = SIGMA_MAX
         try:
             if has_prices and total > 0.0:
                 # Sum-reverting median: the centre glides from x toward
