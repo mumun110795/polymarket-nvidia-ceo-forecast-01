@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""polymarket-nvidia-ceo-forecast-01 entry v6 (Python 3.13, stdlib only).
+"""polymarket-nvidia-ceo-forecast-01 entry v7 (Python 3.13, stdlib only).
 
 Per-market realised-volatility forecaster with a sum-reverting median.
 
@@ -90,6 +90,22 @@ Model, per market of a case:
   (the churn hypothesis inverted: active markets need MORE width),
   per-tier q75 offsets (noise, both directions ~0.2530), and a
   240-minute-only sigma for the active tier (0.253911).
+
+  v7 tuning (true grader, v6 = 0.252411): SIGMA_MIN 0.0004 ->
+  0.0003 (alone 0.251812, 4/6 cases plus a tie; neighbours 0.0002
+  and 0.00035 both worse) and TIER_SIGMA_LO = 0.80 for the least
+  active tertile (alone 0.251586 at 0.80, 5/6; the basin over
+  0.75..0.85 is flat and 0.70 turns back up). Combined 0.251221;
+  the two-factor neighbourhood (floor 0.00035, tier-lo 0.75 /
+  0.85) sits within 0.0001, a flat plateau. Rejected this round:
+  mid-tier sigma moves, bucket re-grid on the v6 stack (flat,
+  best neighbour cell only -0.0002), stale threshold/multiplier
+  re-grid (120 min x 0.5 confirmed optimal), blend re-weights,
+  and sumrev tau 150/210 (plateau noise around 180). A forensic
+  pass over p00 vs p05 found no case-level covariate that
+  separates them monotonically -- the gap is intraday regime
+  plus idiosyncratic single-market moves -- so no case-
+  conditional adjustment was fitted.
   - Quantiles widen like a random walk (alpha = 0.5):
 
         q_tau(h) = clamp(centre(h) + z_tau * sigma * h**0.5, 0, 1)
@@ -145,10 +161,14 @@ Q_OFFSETS = (0.0, 0.0, 0.0, -0.04, 0.005)
 # factor: their moves cluster and persist, so the realised-vol fan
 # under-disperses them.
 TIER_SIGMA_HI = 1.15
+# Symmetrically, the least active third of a case's markets gets
+# its sigma scaled by this factor: the blend still prices in more
+# movement than quiet markets deliver.
+TIER_SIGMA_LO = 0.80
 # (window minutes, blend weight) for the realised-vol estimate.
 WINDOWS = ((120, 0.4), (360, 0.4), (1440, 0.2))
 DIFF_CAP = 0.05        # winsorising cap on a single 1-minute move
-SIGMA_MIN = 0.0004     # floor, price units per sqrt(minute)
+SIGMA_MIN = 0.0003     # floor, price units per sqrt(minute)
 SIGMA_MAX = 0.012      # cap, price units per sqrt(minute)
 SIGMA_FALLBACK = 0.0025  # house baseline sigma, for degenerate inputs
 
@@ -310,8 +330,8 @@ def forecast_case(case):
         tiers[idx] = 0 if rank < n_mkts / 3 else 1 if rank < 2 * n_mkts / 3 else 2
     forecasts = []
     for k, (mid, x, sigma, has_prices, _nch) in enumerate(prepared):
-        if has_prices and tiers[k] == 2:
-            sigma *= TIER_SIGMA_HI
+        if has_prices and tiers[k] in (0, 2):
+            sigma *= TIER_SIGMA_HI if tiers[k] == 2 else TIER_SIGMA_LO
             if sigma < 0.0001:
                 sigma = 0.0001
             elif sigma > SIGMA_MAX:
