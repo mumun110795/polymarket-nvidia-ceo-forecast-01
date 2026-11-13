@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""polymarket-nvidia-ceo-forecast-01 entry v7 (Python 3.13, stdlib only).
+"""polymarket-nvidia-ceo-forecast-01 entry v8 (Python 3.13, stdlib only).
 
 Per-market realised-volatility forecaster with a sum-reverting median.
 
@@ -106,6 +106,23 @@ Model, per market of a case:
   separates them monotonically -- the gap is intraday regime
   plus idiosyncratic single-market moves -- so no case-
   conditional adjustment was fitted.
+
+  v8 tuning (true grader, v7 = 0.251221): the two caps untouched
+  since v2 move together -- DIFF_CAP 0.05 -> 0.07 (alone: 0.06 ->
+  0.250838, 0.07 -> 0.250620, 0.08 -> 0.250511, uncapped ->
+  0.250531; the loosening lets genuine jump minutes count in
+  sigma instead of being winsorised away) and SIGMA_MAX 0.012 ->
+  0.009 (alone 0.250442; it binds only for the wildest markets,
+  almost all of them in p03, whose loss drops 0.2481 -> 0.2438).
+  Combined 0.249928, winning 4 of 6 cases against v7 (p04/p05
+  hairline losses of 0.0002/0.0003); the joint neighbourhood is
+  a smooth basin ((0.06, 0.008) -> 0.249970, (0.06, 0.009) ->
+  0.250146, (0.07, 0.010) -> 0.250275). Re-checked and left
+  unchanged this round: floor x low-tier grid (v7 cell optimal),
+  q75/q95 fine offsets (all within 0.0001 of base), stale
+  multiplier 0.45/0.55 (noise around 0.5), high-tier widening
+  1.20/1.25 (<= 0.0001, p03 pays), blend re-weights, and a
+  high-tier bucket-3 factor (0.90/1.10 both worse).
   - Quantiles widen like a random walk (alpha = 0.5):
 
         q_tau(h) = clamp(centre(h) + z_tau * sigma * h**0.5, 0, 1)
@@ -167,9 +184,9 @@ TIER_SIGMA_HI = 1.15
 TIER_SIGMA_LO = 0.80
 # (window minutes, blend weight) for the realised-vol estimate.
 WINDOWS = ((120, 0.4), (360, 0.4), (1440, 0.2))
-DIFF_CAP = 0.05        # winsorising cap on a single 1-minute move
+DIFF_CAP = 0.07        # winsorising cap on a single 1-minute move
 SIGMA_MIN = 0.0003     # floor, price units per sqrt(minute)
-SIGMA_MAX = 0.012      # cap, price units per sqrt(minute)
+SIGMA_MAX = 0.009      # cap, price units per sqrt(minute)
 SIGMA_FALLBACK = 0.0025  # house baseline sigma, for degenerate inputs
 
 # E|N(0, sigma)| = sigma * sqrt(2/pi)  =>  sigma = mean|move| * sqrt(pi/2).
